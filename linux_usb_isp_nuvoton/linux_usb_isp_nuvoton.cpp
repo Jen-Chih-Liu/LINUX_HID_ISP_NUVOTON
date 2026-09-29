@@ -1,13 +1,36 @@
-//#include <iostream>
 #include <stdio.h>
-//using namespace std;
-#include <unistd.h>
+#include <stdlib.h>
+#include <string.h>
 #include <time.h>
-#include <string.h>
-#include <stdio.h>
-#include <string.h>
-#include "usb.h"
 #include <errno.h>
+
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#ifndef sleep
+#define sleep(sec) Sleep((DWORD)((sec) * 1000))
+#endif
+#ifndef usleep
+#define usleep(usec) Sleep((DWORD)(((usec) + 999) / 1000))
+#endif
+#else
+#include <unistd.h>
+#endif
+
+#if defined(__has_include)
+  #if __has_include(<libusb-1.0/libusb.h>)
+    #include <libusb-1.0/libusb.h>
+  #else
+    #include <libusb.h>
+  #endif
+#else
+  #include <libusb.h>
+#endif
+
+#define USBD_VID            0x0416
+#define USBD_PID            0x3F00
 
 #define CMD_UPDATE_APROM	0x000000A0
 #define CMD_UPDATE_CONFIG	0x000000A1
@@ -31,17 +54,21 @@
 #define APROM_MODE	1
 #define LDROM_MODE	2
 
+#ifdef _WIN32
+// In Windows, BOOL, TRUE, and FALSE are defined in <windows.h>
+#else
 #define BOOL  unsigned char
-#define PAGE_SIZE                      0x00000200     /* Page size */
-
-#define PACKET_SIZE	64//32
-#define FILE_BUFFER	128
 #ifndef TRUE
 # define TRUE 1
 #endif
 #ifndef FALSE
 # define FALSE 0
 #endif
+#endif
+#define PAGE_SIZE                      0x00000200     /* Page size */
+
+#define PACKET_SIZE	64//32
+#define FILE_BUFFER	128
 unsigned char rcvbuf[PACKET_SIZE];
 unsigned char sendbuf[PACKET_SIZE];
 unsigned char aprom_buf[512];
@@ -52,97 +79,170 @@ unsigned short gcksum;
 
 unsigned short Checksum(unsigned char *buf, unsigned int len);
 void WordsCpy(void *dest, void *src, unsigned int size);
+BOOL SendData(void);
+BOOL RcvData(void);
 BOOL CmdSyncPackno(void);
 BOOL CmdGetCheckSum(int flag, int start, int len, unsigned short *cksum);
 BOOL CmdGetDeviceID(unsigned int *devid);
 BOOL CmdGetConfig( unsigned int *config);
+BOOL CmdRunCmd(unsigned int cmd, unsigned int *data);
 BOOL CmdUpdateAprom(char *filename);
 
 #define dbg_printf printf
-#define inpw(addr)            (*(unsigned int *)(addr))
-
-
-
-struct usb_device *usbio_probe()
+static inline unsigned int inpw(const void *addr)
 {
-	struct usb_bus *busses, *bus;
-	usb_init();
-	usb_find_busses();
-	usb_find_devices();
-	busses = usb_get_busses();
-	for (bus = busses; bus; bus = bus->next) {
- 	
-		struct usb_device *dev;
- 	
-		for (dev = bus->devices; dev; dev = dev->next) {
-			struct usb_device_descriptor *desc;
-			desc = &(dev->descriptor);
-			printf("Vendor/Product ID: %04x:%04x\n",
-				desc->idVendor,
-				desc->idProduct);
-			if ((desc->idVendor == (0x0416)) && (desc->idProduct == (0xa317))) 
-			{
-				return dev;
+	unsigned int val = 0;
+	memcpy(&val, addr, sizeof(val));
+	return val;
+}
+
+
+
+static libusb_context *g_ctx = NULL;
+static libusb_device_handle *udev = NULL;
+
+libusb_device_handle *usbio_probe(libusb_context *ctx, unsigned short target_vid, unsigned short target_pid)
+{
+	libusb_device **devs = NULL;
+	ssize_t cnt = libusb_get_device_list(ctx, &devs);
+	if (cnt < 0) {
+		fprintf(stderr, "libusb_get_device_list error %d\n", (int)cnt);
+		return NULL;
+	}
+
+	libusb_device *found_dev = NULL;
+	for (ssize_t i = 0; i < cnt; i++) {
+		struct libusb_device_descriptor desc;
+		int r = libusb_get_device_descriptor(devs[i], &desc);
+		if (r < 0) continue;
+		printf("Vendor/Product ID: %04x:%04x\n",
+			desc.idVendor,
+			desc.idProduct);
+		if ((desc.idVendor == target_vid) && (desc.idProduct == target_pid || (target_pid == USBD_PID && desc.idProduct == 0xa317))) {
+			found_dev = devs[i];
+			break;
+		}
+	}
+
+	libusb_device_handle *handle = NULL;
+	if (found_dev != NULL) {
+		int r = libusb_open(found_dev, &handle);
+		if (r != 0) {
+			fprintf(stderr, "libusb_open error %d (%s)\n", r, libusb_error_name(r));
+			handle = NULL;
+		}
+	}
+
+	libusb_free_device_list(devs, 1);
+	return handle;
+}
+
+int main(int argc, char *argv[])
+{	
+	setvbuf(stdout, NULL, _IONBF, 0);
+	clock_t start_time, end_time;
+	float total_time = 0;
+	int r = 1;
+	unsigned short target_vid = USBD_VID;
+	unsigned short target_pid = USBD_PID;
+	const char *bin_filename = NULL;
+	BOOL jump_aprom = FALSE;
+	int pos_arg = 0;
+
+	for (int i = 1; i < argc; i++) {
+		if (strcmp(argv[i], "--jumpAP") == 0) {
+			jump_aprom = TRUE;
+		} else {
+			if (pos_arg == 0) {
+				bin_filename = argv[i];
+				pos_arg++;
+			} else if (pos_arg == 1) {
+				target_pid = (unsigned short)strtoul(argv[i], NULL, 16);
+				pos_arg++;
+			} else if (pos_arg == 2) {
+				target_vid = (unsigned short)strtoul(argv[i], NULL, 16);
+				pos_arg++;
 			}
 		}
 	}
-	return NULL;
-}
 
-usb_dev_handle *udev;
-int main(int argc, char *argv[])
-{	
-	clock_t start_time, end_time;
-	float total_time = 0;
-	start_time = clock(); /* mircosecond */
-	char szdata[64];
-	struct usb_device *dev;
-	struct usb_device_descriptor *desc;
-	
-	int r = 1, i = 0;
-  	
-	dev = usbio_probe();
-	desc = &(dev->descriptor);
-	if (dev == NULL) {
+	if (bin_filename == NULL) {
+		printf("Usage: %s <firmware_file.bin> [--jumpAP] [PID_HEX] [VID_HEX]\n", argv[0]);
+		printf("Options:\n");
+		printf("  --jumpAP       Jump to APROM and reboot MCU after successful programming\n");
+		printf("Default Target: VID=0x%04X, PID=0x%04X\n", USBD_VID, USBD_PID);
+		return -1;
+	}
+
+	printf("Target device VID: 0x%04X, PID: 0x%04X\n", target_vid, target_pid);
+	if (jump_aprom) {
+		printf("Option --jumpAP enabled: Will jump to APROM after programming.\n");
+	}
+
+	start_time = clock(); /* microsecond / clock ticks */
+
+	r = libusb_init(&g_ctx);
+	if (r < 0) {
+		fprintf(stderr, "libusb_init error %d (%s)\n", r, libusb_error_name(r));
+		return -1;
+	}
+
+	udev = usbio_probe(g_ctx, target_vid, target_pid);
+	if (udev == NULL) {
 		printf("USB IO Card not found.\n");
+		libusb_exit(g_ctx);
 		return -1;
 	}
-	//Open USB port
-	udev = usb_open(dev);
-	r = usb_detach_kernel_driver_np(udev, 0);
-	printf("usb_detach_kernel_driver_np: ret %d\n", r);
-	r = usb_set_configuration(udev, dev->descriptor.bNumConfigurations);
-	if (r < 0) {
-		fprintf(stderr, "libusb_set_configuration error %d\n", r);
-		return -1;
+
+#if defined(LIBUSB_API_VERSION) && (LIBUSB_API_VERSION >= 0x01000102)
+	libusb_set_auto_detach_kernel_driver(udev, 1);
+#elif !defined(_WIN32)
+	if (libusb_kernel_driver_active(udev, 0) == 1) {
+		r = libusb_detach_kernel_driver(udev, 0);
+		printf("libusb_detach_kernel_driver: ret %d\n", r);
 	}
-	
-	// sudo chmod o+w /dev/bus/usb/001/003 for linux
-	r = usb_claim_interface(udev, 0);
+#endif
+
+	int current_config = 0;
+	libusb_get_configuration(udev, &current_config);
+	if (current_config != 1) {
+		libusb_set_configuration(udev, 1);
+	}
+
+	r = libusb_claim_interface(udev, 0);
 	if (r < 0) {
-		fprintf(stderr, "libusb_claim_interface error %d\n", r);
+		fprintf(stderr, "libusb_claim_interface error %d (%s)\n", r, libusb_error_name(r));
+		libusb_close(udev);
+		libusb_exit(g_ctx);
 		return -1;
 	}
 	printf("Successfully claimed interface\n");
-	
-	if (CmdUpdateAprom(argv[1]) == TRUE)
+
+	if (CmdUpdateAprom((char *)bin_filename) == TRUE)
 	{
 		printf("Process=%.2f \r", 100.0); // Print progress information
 		printf("programmer pass\n\r");	  // Print success message for programming
+		if (jump_aprom) {
+			printf("Jumping to APROM...\n\r");
+			CmdRunCmd(CMD_RUN_APROM, NULL);
+		}
 	}
 	else
 	{
-		printf("programmer flase\n\r"); // Print error message for programming failure
+		printf("programmer false\n\r"); // Print error message for programming failure
 	}	
-	usb_close(udev);
+
+	libusb_release_interface(udev, 0);
+	libusb_close(udev);
+	libusb_exit(g_ctx);
+
 	end_time = clock();
 /* CLOCKS_PER_SEC is defined at time.h */
 	total_time = (float)(end_time - start_time) / CLOCKS_PER_SEC;
 
 	printf("Time : %f sec \n", total_time);
+	return 0;
 }
-
-
 
 void WordsCpy(void *dest, void *src, unsigned int size)
 {
@@ -156,12 +256,12 @@ void WordsCpy(void *dest, void *src, unsigned int size)
 		pu8Dest[i] = pu8Src[i]; 
 }
 
-unsigned short Checksum(unsigned char *buf, int len)
+unsigned short Checksum(unsigned char *buf, unsigned int len)
 {
-	int i;
-	unsigned short c;
+	unsigned int i;
+	unsigned short c = 0;
 
-	for (c = 0, i = 0; i < len; i++) {
+	for (i = 0; i < len; i++) {
 		c += buf[i];
 	}
 	return (c);
@@ -169,11 +269,14 @@ unsigned short Checksum(unsigned char *buf, int len)
 
 BOOL SendData(void)
 {
-
-
 	gcksum = Checksum(sendbuf, PACKET_SIZE);
 
-	usb_interrupt_write(udev, 0x02, (char*)sendbuf, PACKET_SIZE, 10000);//send
+	int transferred = 0;
+	int r = libusb_interrupt_transfer(udev, 0x02, sendbuf, PACKET_SIZE, &transferred, 10000);
+	if (r != 0) {
+		dbg_printf("SendData interrupt transfer error: %d (%s)\n", r, libusb_error_name(r));
+		return FALSE;
+	}
 
 	return TRUE;
 }
@@ -181,11 +284,16 @@ BOOL SendData(void)
 BOOL RcvData(void)
 {
 	BOOL Result;
-	unsigned short lcksum, i;
+	unsigned short lcksum;
 	unsigned char *pBuf;
-	usb_interrupt_read(udev, 0x81, (char*)rcvbuf, PACKET_SIZE, 10000);//get
 
-	
+	int transferred = 0;
+	int r = libusb_interrupt_transfer(udev, 0x81, rcvbuf, PACKET_SIZE, &transferred, 15000);
+	if (r != 0) {
+		dbg_printf("RcvData interrupt transfer error: %d (%s)\n", r, libusb_error_name(r));
+		return FALSE;
+	}
+
 	pBuf = rcvbuf;
 	WordsCpy(&lcksum, pBuf, 2);
 	pBuf += 4;
@@ -336,40 +444,47 @@ BOOL CmdUpdateConfig(unsigned int *conf)
 //CMD_WRITE_CHECKSUM
 BOOL CmdRunCmd(unsigned int cmd, unsigned int *data)
 {
-	BOOL Result;
-	unsigned int cmdData, i;
+	BOOL Result = TRUE;
+	unsigned int cmdData;
 	
 	//sync send&recv packno
 	memset(sendbuf, 0, PACKET_SIZE);
 	cmdData = cmd;
 	WordsCpy(sendbuf + 0, &cmdData, 4);
 	WordsCpy(sendbuf + 4, &g_packno, 4);
-	if (cmd == CMD_WRITE_CHECKSUM)
+	if (cmd == CMD_WRITE_CHECKSUM && data != NULL)
 	{
 		WordsCpy(sendbuf + 8, &data[0], 4);
 		WordsCpy(sendbuf + 12, &data[1], 4);
 	}
 	g_packno++;
 	
-	SendData();
+	if (!SendData()) {
+		return FALSE;
+	}
+
 	if ((cmd == CMD_ERASE_ALL) || (cmd == CMD_GET_FLASHMODE) 
 			|| (cmd == CMD_WRITE_CHECKSUM))
 	{
 		Result = RcvData();
 		if (Result)
 		{
-			if (cmd == CMD_GET_FLASHMODE)
+			if (cmd == CMD_GET_FLASHMODE && data != NULL)
 			{
 				WordsCpy(&cmdData, rcvbuf + 8, 4);
 				*data = cmdData;
 			}
 		}
-		
 	}
 	else if ((cmd == CMD_RUN_APROM) || (cmd == CMD_RUN_LDROM)
 		|| (cmd == CMD_RESET))
 	{
-		sleep(500);
+#ifdef _WIN32
+		Sleep(100);
+#else
+		usleep(100000);
+#endif
+		Result = TRUE;
 	}
 	return Result;
 }
@@ -385,7 +500,7 @@ BOOL CmdUpdateAprom(char *filename)
 	unsigned short get_cksum;
 	unsigned char Buff[256];
 	unsigned int s1;
-	FILE *fp;		//taget bin file pointer	
+	FILE *fp = NULL;		//taget bin file pointer	
 
 	g_packno = 1;
 	
@@ -452,8 +567,6 @@ BOOL CmdUpdateAprom(char *filename)
 	//send CMD_UPDATE_APROM
 	SendData();
 	printf("erase chip ...\n\r");
-	//for erase time delay using, other bus need it.
-	sleep(3);
 	Result = RcvData();
 	if (Result == FALSE)
 		goto out1;
@@ -479,7 +592,6 @@ BOOL CmdUpdateAprom(char *filename)
 			fread(&sendbuf[8], sizeof(char), 56, fp);
 			//read check  package
 			SendData();
-			usleep(50000);
 			Result = RcvData();
 			if (Result == FALSE)
 				goto out1;			
@@ -490,7 +602,6 @@ BOOL CmdUpdateAprom(char *filename)
 			fread(&sendbuf[8], sizeof(char), file_totallen - i, fp);
 			  //read target chip checksum
 			SendData();
-			usleep(50000);
 			Result = RcvData();
 			if (Result == FALSE)			
 				goto out1;	
@@ -506,6 +617,11 @@ BOOL CmdUpdateAprom(char *filename)
 	}
 
 out1:
+	if (fp != NULL)
+	{
+		fclose(fp);
+		fp = NULL;
+	}
 	return Result;
 	
 }

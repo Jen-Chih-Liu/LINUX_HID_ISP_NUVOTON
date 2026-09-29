@@ -1,0 +1,9 @@
+build/
+build*/
+bin/
+.vs/
+*.user
+*.suo
+CMakeUserPresets.json
+*.dump
+*.ctu-info
